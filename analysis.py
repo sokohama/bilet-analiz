@@ -104,6 +104,123 @@ def analyze(df_city: pd.DataFrame) -> dict:
     return result
 
 
+WEEKDAYS = ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar"]
+MONTHS_TR = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran",
+             "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"]
+
+
+def fmt_date(ts) -> str:
+    ts = pd.Timestamp(ts)
+    return f"{ts.day} {MONTHS_TR[ts.month - 1]} {ts.year}"
+
+
+def with_dates(df):
+    """Kalkış tarihini (depart_dt) ekler; tarih bilgisi yoksa None döner."""
+    d = df.copy()
+    dt = None
+    if "depart_date" in d.columns:
+        dt = pd.to_datetime(d["depart_date"], errors="coerce")
+    if (dt is None or dt.isna().all()) and "snapshot_date" in d.columns:
+        dt = pd.to_datetime(d["snapshot_date"], errors="coerce") + pd.to_timedelta(d["days_before"], unit="D")
+    if dt is None:
+        return None
+    d["depart_dt"] = dt
+    d = d.dropna(subset=["depart_dt"])
+    return d if len(d) else None
+
+
+def cheapest_dates(df_city: pd.DataFrame, k: int = 5):
+    """En düşük fiyatlı k kalkış tarihi (tarih, fiyat, kalan gün, haftanın günü)."""
+    d = with_dates(df_city)
+    if d is None:
+        return None
+    d = d.sort_values(["price", "days_before"]).drop_duplicates("depart_dt").head(k)
+    d = d[["depart_dt", "price", "days_before"]].copy()
+    d["weekday"] = d["depart_dt"].dt.dayofweek.map(lambda i: WEEKDAYS[i])
+    return d.reset_index(drop=True)
+
+
+def weekday_stats(df_city: pd.DataFrame):
+    """Kalkış gününe (haftanın günü) göre fiyat.
+
+    'rel' = fiyatın, çevresindeki ~15 günlük medyan fiyata oranı. Böylece tatil/sezon
+    etkisi azalır ve gerçekten hafta günü farkı ölçülür (1.00 = çevresiyle aynı).
+    """
+    d = with_dates(df_city)
+    if d is None or len(d) < 14:
+        return None
+    d = d.sort_values("depart_dt")
+    s = d.set_index("depart_dt")["price"]
+    local = s.rolling("15D", center=True, min_periods=5).median()
+    d = d.assign(rel=s.to_numpy() / local.to_numpy(), wd=d["depart_dt"].dt.dayofweek.to_numpy())
+    d = d.dropna(subset=["rel"])
+    if d.empty:
+        return None
+    g = d.groupby("wd").agg(n=("price", "size"), median=("price", "median"), rel=("rel", "median"))
+    g = g.reindex(range(7)).dropna(subset=["n"])
+    g["weekday"] = [WEEKDAYS[i] for i in g.index]
+    g["n"] = g["n"].astype(int)
+    return g.reset_index(drop=True)[["weekday", "n", "median", "rel"]]
+
+
+def lead_range(win: pd.DataFrame, tol: float = 0.10, min_n: int = 5):
+    """En ucuz aralık ve medyanı %tol içinde olan komşu aralıklar -> (etiketler, alt, üst, medyan)."""
+    w = win[win["count"] >= min_n].reset_index(drop=True)
+    if w.empty:
+        w = win.reset_index(drop=True)
+    bi = int(w["median"].idxmin())
+    limit = w.loc[bi, "median"] * (1 + tol)
+    lo_i = hi_i = bi
+    while lo_i > 0 and w.loc[lo_i - 1, "median"] <= limit:
+        lo_i -= 1
+    while hi_i < len(w) - 1 and w.loc[hi_i + 1, "median"] <= limit:
+        hi_i += 1
+    bounds = {name: (lo, hi) for lo, hi, name in WINDOWS}
+    labels = [str(x) for x in w.loc[lo_i:hi_i, "window"]]
+    return labels, bounds[labels[0]][0], bounds[labels[-1]][1], float(w.loc[bi, "median"])
+
+
+def recommend(df_city: pd.DataFrame, res: dict, wd=None) -> list:
+    """Veriden 'ne zaman almak mantıklı' önerileri üretir (Markdown metin listesi)."""
+    tips = []
+    labels, lo, hi, best_med = lead_range(res["windows"])
+    rng = f"{lo}+ gün" if hi >= 10_000 else f"{lo}-{hi} gün"
+    pct = res.get("saving_vs_last_minute_pct")
+    extra = f"; son dakikaya (0-3 gün) göre yaklaşık %{pct:.0f} daha ucuz" if pct and pct > 1 else ""
+    tips.append(f"**Alım zamanı:** Kalkıştan **{rng}** önce almak en uygun görünüyor (medyan fiyat {best_med:.0f}{extra}).")
+
+    d = with_dates(df_city)
+    if d is not None:
+        sub = d[(d["days_before"] >= lo) & (d["days_before"] <= hi)]
+        if len(sub):
+            r = sub.sort_values(["price", "days_before"]).iloc[0]
+            tips.append(
+                f"**Şu anki en iyi seçenek:** bu aralıktaki en ucuz tarih **{fmt_date(r['depart_dt'])} "
+                f"({WEEKDAYS[r['depart_dt'].dayofweek]})**, fiyat **{r['price']:.0f}** "
+                f"(bugünden {int(r['days_before'])} gün sonra)."
+            )
+
+    if wd is not None:
+        ok = wd[wd["n"] >= 4]
+        if len(ok) >= 3:
+            b = ok.loc[ok["rel"].idxmin()]
+            w = ok.loc[ok["rel"].idxmax()]
+            if w["rel"] - b["rel"] >= 0.10:
+                tips.append(
+                    f"**Kalkış günü:** {b['weekday']} en ucuz, {w['weekday']} en pahalı gün. Tarihin esnekse "
+                    f"{b['weekday']} günü uçmayı dene (çevresindeki günlere göre yaklaşık "
+                    f"%{abs(1 - b['rel']) * 100:.0f} fark)."
+                )
+            else:
+                tips.append("**Kalkış günü:** haftanın günleri arasında belirgin bir fark yok; tarih seçerken en ucuz tarihlere bak.")
+
+    tips.append(
+        "**Not:** Bu analiz tek günlük bir fiyat görüntüsüne dayanıyor ve mevsim etkisini tam ayıramaz. "
+        "Aynı rotayı birkaç hafta boyunca tekrar kaydedersen öneri güvenilirleşir."
+    )
+    return tips
+
+
 def sample_data(city: str = "Berlin", seed: int = 7) -> pd.DataFrame:
     """SADECE DEMO: gerçek veri değildir. Tipik 'U' şeklinde bir eğri simüle eder."""
     rng = np.random.default_rng(seed)

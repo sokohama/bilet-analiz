@@ -4,7 +4,16 @@ from datetime import date, datetime
 import pandas as pd
 import streamlit as st
 
-from analysis import analyze, clean, from_prices, sample_data
+from analysis import (
+    analyze,
+    cheapest_dates,
+    clean,
+    fmt_date,
+    from_prices,
+    recommend,
+    sample_data,
+    weekday_stats,
+)
 from extract import ExtractError, extract_prices
 
 
@@ -28,9 +37,9 @@ def get_key():
 
 st.set_page_config(page_title="Bilet Fiyat Analizi", page_icon="✈️")
 st.title("✈️ Bilet Fiyat Analizi")
-st.caption("Fiyat takviminin ekran görüntüsünü yükle; kaç gün önce almanın en ucuz olduğunu hesaplasın.")
+st.caption("Fiyat takvimini yükle; kaç gün önce, hangi gün ve ne kadara almanın en ucuz olduğunu hesaplasın.")
 
-mode = st.radio("Veri kaynağı", ["📷 Fotoğraf", "CSV", "Elle", "Demo"], horizontal=True)
+mode = st.radio("Veri kaynağı", ["CSV", "📷 Fotoğraf", "Elle", "Demo"], horizontal=True)
 df_raw = None
 photo_mode = False
 
@@ -59,15 +68,15 @@ if mode == "📷 Fotoğraf":
             with st.spinner("Fotoğraf okunuyor..."):
                 for f in files:
                     try:
-                        res = extract_prices(f.getvalue(), f.type or "image/png", snap, key)
+                        res_x = extract_prices(f.getvalue(), f.type or "image/png", snap, key)
                     except ExtractError as e:
                         st.error(f"{f.name}: {e}")
                         continue
-                    for r in res["prices"]:
+                    for r in res_x["prices"]:
                         merged[r["date"]] = r["price"]
                     for k in ("origin", "destination", "currency"):
-                        if res.get(k) and not meta.get(k):
-                            meta[k] = res[k]
+                        if res_x.get(k) and not meta.get(k):
+                            meta[k] = res_x[k]
             if merged:
                 st.session_state["photo_rows"] = pd.DataFrame(
                     [{"date": d, "price": p} for d, p in sorted(merged.items())]
@@ -99,11 +108,15 @@ if mode == "📷 Fotoğraf":
             "Bu veriyi CSV olarak indir",
             df_raw.to_csv(index=False),
             f"bilet_{snap_used:%Y%m%d}.csv",
-            help="Aynı rotayı günler sonra tekrar fotoğraflayıp CSV'leri 'CSV' modunda birlikte yüklersen analiz güçlenir.",
+            help="Aynı rotayı günler sonra tekrar kaydedip CSV'leri 'CSV' modunda birlikte yüklersen analiz güçlenir.",
         )
 
 elif mode == "CSV":
-    ups = st.file_uploader("CSV (city, days_before, price)", type="csv", accept_multiple_files=True)
+    ups = st.file_uploader(
+        "CSV dosyaları (her rota için bir dosya; birden fazla seçebilirsin)",
+        type="csv",
+        accept_multiple_files=True,
+    )
     if ups:
         df_raw = pd.concat([pd.read_csv(u) for u in ups], ignore_index=True)
 
@@ -131,28 +144,75 @@ if df.empty:
 
 st.divider()
 cities = sorted(df["city"].unique())
-city = st.selectbox("Şehir", cities) if len(cities) > 1 else cities[0]
+city = st.selectbox("Rota / şehir", cities) if len(cities) > 1 else cities[0]
 d = df[df["city"] == city]
 res = analyze(d)
+cd = cheapest_dates(d, 5)
+wd = weekday_stats(d)
 
-st.metric("En uygun aralık", res["best_window"], f"medyan {res['best_median']:.0f}")
+# --- Özet ---
+st.metric("En uygun alım aralığı", res["best_window"], f"medyan {res['best_median']:.0f}", delta_color="off")
+if cd is not None:
+    mn = cd.iloc[0]
+    st.metric(
+        "En düşük fiyat",
+        f"{mn['price']:.0f}",
+        f"{fmt_date(mn['depart_dt'])} ({mn['weekday']}) · {int(mn['days_before'])} gün kala",
+        delta_color="off",
+    )
+else:
+    bd = res["best_day"]
+    st.metric("En düşük fiyat", f"{bd['price']:.0f}", f"kalkışa {bd['day']} gün kala", delta_color="off")
 c1, c2 = st.columns(2)
 c1.metric("Genele göre tasarruf", f"%{res['saving_vs_overall_pct']:.1f}")
 if "saving_vs_last_minute_pct" in res:
     c2.metric("Son dakikaya göre tasarruf", f"%{res['saving_vs_last_minute_pct']:.1f}")
 
-bd = res["best_day"]
-st.success(
-    f"**{city}:** en ucuz aralık kalkıştan **{res['best_window']}** önce. "
-    f"Tek gün olarak en düşük: **{bd['day']} gün** önce (medyan {bd['price']:.0f})."
-)
 if res["low_data"]:
     st.warning("Gözlem sayısı az; sonuç güvenilir olmayabilir.")
+
+# --- Tavsiye ---
+st.subheader("💡 Ne zaman almak mantıklı?")
+for tip in recommend(d, res, wd):
+    st.markdown(f"- {tip}")
+
+# --- En ucuz günler ---
+if cd is not None:
+    st.subheader("En ucuz 5 kalkış günü")
+    st.dataframe(
+        pd.DataFrame(
+            {
+                "tarih": [fmt_date(x) for x in cd["depart_dt"]],
+                "gün": cd["weekday"],
+                "fiyat": cd["price"].round(0).astype(int),
+                "kalkışa kalan gün": cd["days_before"].astype(int),
+            }
+        ),
+        hide_index=True,
+    )
+
+# --- Haftanın günü ---
+if wd is not None:
+    st.subheader("Haftanın gününe göre fiyat")
+    st.caption("Kalkış gününe göre. 'Fark %' = o günün fiyatının çevresindeki ~2 haftalık fiyat düzeyine göre farkı (eksi = daha ucuz).")
+    st.dataframe(
+        pd.DataFrame(
+            {
+                "gün": wd["weekday"],
+                "gözlem": wd["n"],
+                "medyan fiyat": wd["median"].round(0).astype(int),
+                "fark %": ((wd["rel"] - 1) * 100).round(0).astype(int),
+            }
+        ),
+        hide_index=True,
+    )
+elif cd is None:
+    st.caption("Haftanın günü analizi için kalkış tarihi gerekir (fotoğraf modu veya tarih sütunlu CSV).")
+
 if photo_mode:
     st.caption(
         "Not: Tek fotoğraf, 'bugün alırsam' kalkışa kalan gün sayısına göre fiyatı gösterir. "
-        "Hafta içi/sonu ve tatil dönemleri de fiyatı etkiler; aynı rotayı günler içinde tekrar "
-        "fotoğraflarsan sonuç daha güvenilir olur."
+        "Aynı rotayı günler içinde tekrar kaydedersen sonuç daha güvenilir olur."
     )
 
 st.subheader("Kalan güne göre fiyat")
@@ -168,16 +228,15 @@ st.dataframe(
 )
 
 if len(cities) > 1:
-    st.subheader("Şehir karşılaştırması")
+    st.subheader("Rota karşılaştırması")
     rows_c = []
     for c in cities:
-        r = analyze(df[df["city"] == c])
-        rows_c.append(
-            {
-                "şehir": c,
-                "en uygun aralık": r["best_window"],
-                "medyan": round(r["best_median"], 1),
-                "tasarruf %": round(r["saving_vs_overall_pct"], 1),
-            }
-        )
+        dc = df[df["city"] == c]
+        r = analyze(dc)
+        cdc = cheapest_dates(dc, 1)
+        row = {"rota": c, "en uygun aralık": r["best_window"], "medyan": round(r["best_median"], 1)}
+        if cdc is not None:
+            row["en düşük fiyat"] = int(cdc.iloc[0]["price"])
+            row["tarihi"] = fmt_date(cdc.iloc[0]["depart_dt"])
+        rows_c.append(row)
     st.dataframe(pd.DataFrame(rows_c), hide_index=True)
