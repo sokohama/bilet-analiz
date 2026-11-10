@@ -24,9 +24,27 @@ def _label(d: float) -> str:
     return "?"
 
 
+def from_prices(city: str, snapshot, prices: pd.DataFrame) -> pd.DataFrame:
+    """Tarih/fiyat tablosunu (date, price) analiz formatına çevirir.
+
+    days_before = kalkış tarihi - snapshot (fotoğrafın çekildiği gün).
+    """
+    d = prices.copy()
+    d.columns = [str(c).strip().lower() for c in d.columns]
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d["price"] = pd.to_numeric(d["price"], errors="coerce")
+    d = d.dropna(subset=["date", "price"])
+    snap = pd.Timestamp(snapshot)
+    d["days_before"] = (d["date"] - snap).dt.days
+    d["city"] = city
+    d["snapshot_date"] = snap.date()
+    d["depart_date"] = d["date"].dt.date
+    return d[["city", "snapshot_date", "depart_date", "days_before", "price"]].reset_index(drop=True)
+
+
 def clean(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = [c.strip().lower() for c in df.columns]
+    df.columns = [str(c).strip().lower() for c in df.columns]
     for col in ("city", "days_before", "price"):
         if col not in df.columns:
             raise ValueError(f"Eksik sütun: {col}")
@@ -47,12 +65,11 @@ def by_window(df_city: pd.DataFrame) -> pd.DataFrame:
     return g.sort_values("window").reset_index(drop=True)
 
 
-def best_day(df_city: pd.DataFrame, min_obs: int = 1) -> dict:
-    """Gün bazında medyan fiyat; yalnızca birkaç gözlem varsa komşu günlerle yumuşatır."""
+def best_day(df_city: pd.DataFrame) -> dict:
+    """Gün bazında medyan fiyatı en düşük olan günü bulur (eşitlikte en yakın gün)."""
     daily = df_city.groupby("days_before")["price"].median().sort_index()
-    smooth = daily.rolling(3, center=True, min_periods=1).mean()
-    day = int(smooth.idxmin())
-    return {"day": day, "price": float(daily.loc[day]), "smoothed": float(smooth.loc[day])}
+    day = int(daily.idxmin())
+    return {"day": day, "price": float(daily.loc[day])}
 
 
 def analyze(df_city: pd.DataFrame) -> dict:
@@ -80,7 +97,6 @@ def analyze(df_city: pd.DataFrame) -> dict:
     if len(last_minute):
         lm = float(last_minute["median"].iloc[0])
         result["saving_vs_last_minute_pct"] = float((lm - best["median"]) / lm * 100)
-    # Az veri uyarısı
     result["low_data"] = len(df_city) < 15 or int(best["count"]) < 3
     return result
 
@@ -89,7 +105,6 @@ def sample_data(city: str = "Berlin", seed: int = 7) -> pd.DataFrame:
     """SADECE DEMO: gerçek veri değildir. Tipik 'U' şeklinde bir eğri simüle eder."""
     rng = np.random.default_rng(seed)
     days = np.array([1, 2, 3, 5, 7, 10, 14, 17, 21, 25, 30, 35, 45, 60, 75, 90])
-    base = 120 + 0.035 * (days - 28) ** 2 * (days < 28) + 0.03 * np.maximum(days - 60, 0) ** 1.0
     base = 105 + 0.12 * (28 - days) ** 2 / 4 * (days < 28) + 0.5 * np.maximum(days - 60, 0)
     rows = []
     for d, b in zip(days, base):
